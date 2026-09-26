@@ -126,5 +126,6 @@ Put the same value in `firmware/shiptrace_beacon/secrets.h`. Both files are giti
 - The beacon keeps its last sequence number in RAM, so a reboot resets replay protection until the next valid command. Persisting it to flash is a planned improvement.
 
 ## Team
+Reuben Tharakan | Ishaan Khambaswadkar | Vihaan Chindarkar
 
 HackGT 13 · Georgia Tech
