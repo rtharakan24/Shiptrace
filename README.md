@@ -113,9 +113,10 @@ Put the same value in `firmware/shiptrace_beacon/secrets.h`. Both files are giti
 | Logitech C270 webcam | Overhead view of the water tank |
 | Raspberry Pi 3 or laptop | Vision + ground control |
 | Inland ESP32 DevKit (ESP-WROOM-32) | Rescue beacon: verification and actuation |
-| Standard 0–180° servo | Searchlight aiming |
-| Relay module + NPN transistor | Physical power kill for the servo |
-| 4×AA battery pack | Servo power (isolated from logic) |
+| DC gearmotor | Searchlight actuator, pulses for 1 s per valid AIM command |
+| 3× 2SA1015 PNP transistors (Darlington) | Motor switching, driven by releasing the GPIO pin |
+| FR207 flyback diode | Absorbs voltage spike when the motor switches off |
+| 2×AA battery pack (3V) | Motor power, isolated from logic — kept below 3.3V so the PNP transistors fully switch off |
 | Red/green LEDs, pushbutton | Status and physical reset |
 
 ## Honest limitations
