@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-SHIPTRACE vision tracker -- finds the floating ORANGE target in the tote and
-emits the searchlight servo bearing (0-180 deg) as JSON lines on stdout.
+SHIPTRACE vision tracker -- finds the floating high-visibility target in the tote
+(any colour listed in config "targets"; default ORANGE and NEON GREEN) and emits the
+searchlight servo bearing (0-180 deg) as JSON lines on stdout. If several coloured
+blobs are visible, the largest one wins.
 
 Dependencies: Python 3, opencv-python (or python3-opencv from apt), numpy.
 
 STDOUT CONTRACT (one JSON object per line, only when a command should be sent):
-  {"t": 1727400000.123, "state": "TARGET_ACQUIRED", "angle": 97, "cx": 412, "cy": 188, "radius": 23}
+  {"t": 1727400000.123, "state": "TARGET_ACQUIRED", "angle": 97, "cx": 412, "cy": 188, "radius": 23, "target": "orange"}
   {"t": 1727400001.456, "state": "SEARCHING", "angle": null}
 Everything else goes to stderr.
 
@@ -16,7 +18,8 @@ last emitted line (or on (re)acquisition).
 
 Usage (see README.md):
   python vision/tracker.py --source 0                 # live camera
-  python vision/tracker.py --source 0 --tune          # HSV trackbars, 's' saves
+  python vision/tracker.py --source 0 --tune          # HSV trackbars for "orange", 's' saves
+  python vision/tracker.py --source 0 --tune --tune-target green   # tune the green range
   python vision/tracker.py --source 0 --calibrate     # click the servo
   python vision/tracker.py --source demo.mp4          # video file, loops
   python vision/tracker.py --source 0 --headless      # Pi over SSH
@@ -39,9 +42,13 @@ WIN_MAIN = "SHIPTRACE"
 WIN_MASK = "Mask"
 WIN_CTRL = "HSV Controls"
 
+DEFAULT_TARGETS = [
+    {"name": "orange", "lower": [5, 120, 120], "upper": [25, 255, 255]},
+    {"name": "green", "lower": [35, 100, 100], "upper": [80, 255, 255]},   # neon / lime green
+]
+
 DEFAULT_CONFIG = {
-    "hsv_lower": [5, 120, 120],
-    "hsv_upper": [25, 255, 255],
+    "targets": DEFAULT_TARGETS,
     "min_area": 150,
     "morph_kernel": 5,
     "servo_x": 320,
@@ -83,6 +90,17 @@ def load_config(path):
             die("could not read config %s: %s" % (path, e), 2)
         if not isinstance(user, dict):
             die("config %s must be a JSON object" % path, 2)
+        # Legacy single-colour config (hsv_lower/hsv_upper): keep the tuned orange
+        # values as the first target and add the default green target.
+        if "targets" not in user and ("hsv_lower" in user or "hsv_upper" in user):
+            legacy = {"name": "orange",
+                      "lower": user.pop("hsv_lower", DEFAULT_TARGETS[0]["lower"]),
+                      "upper": user.pop("hsv_upper", DEFAULT_TARGETS[0]["upper"])}
+            user["targets"] = [legacy] + copy.deepcopy(DEFAULT_TARGETS[1:])
+            log("migrated old hsv_lower/hsv_upper config to 'targets' (orange + green)")
+            migrated = True
+        else:
+            migrated = False
         for k, v in user.items():
             if k not in DEFAULT_CONFIG:
                 log("warning: unknown config key '%s' ignored" % k)
@@ -90,12 +108,22 @@ def load_config(path):
             cfg[k] = v
     else:
         log("config %s not found -- using defaults and creating it" % path)
+        migrated = False
         save_config(path, cfg)
 
     # Sanitise types so a hand-edited config can't crash the loop.
     try:
-        cfg["hsv_lower"] = [int(x) for x in cfg["hsv_lower"]][:3]
-        cfg["hsv_upper"] = [int(x) for x in cfg["hsv_upper"]][:3]
+        targets = []
+        for t in cfg["targets"]:
+            lo = [int(x) for x in t["lower"]][:3]
+            hi = [int(x) for x in t["upper"]][:3]
+            if len(lo) != 3 or len(hi) != 3:
+                die("target '%s': lower/upper must each have 3 numbers" % t.get("name", "?"), 2)
+            targets.append({"name": str(t.get("name", "target%d" % len(targets))),
+                            "lower": lo, "upper": hi})
+        if not targets:
+            die("config 'targets' is empty -- need at least one colour", 2)
+        cfg["targets"] = targets
         for k in ("min_area", "morph_kernel", "servo_x", "servo_y", "acquire_frames",
                   "rotate", "frame_width", "frame_height", "process_width", "record_fps"):
             cfg[k] = int(cfg[k])
@@ -104,14 +132,15 @@ def load_config(path):
         cfg["invert"] = bool(cfg["invert"])
     except (TypeError, ValueError, KeyError) as e:
         die("bad value in config %s: %s" % (path, e), 2)
-    if len(cfg["hsv_lower"]) != 3 or len(cfg["hsv_upper"]) != 3:
-        die("hsv_lower / hsv_upper must each have 3 numbers", 2)
     if cfg["rotate"] not in (0, 90, 180, 270):
         die("rotate must be 0, 90, 180 or 270", 2)
     cfg["ema_alpha"] = min(1.0, max(0.01, cfg["ema_alpha"]))
     cfg["morph_kernel"] = max(1, cfg["morph_kernel"])
     cfg["acquire_frames"] = max(1, cfg["acquire_frames"])
     cfg["record_fps"] = max(1, cfg["record_fps"])
+    if migrated:
+        save_config(path, cfg)
+    log("tracking colours: %s" % ", ".join(t["name"] for t in cfg["targets"]))
     return cfg
 
 
@@ -252,6 +281,7 @@ class Detector(object):
         self.cfg = cfg
         self._k = None
         self._kernel = None
+        self.preview_name = None   # in --tune mode, show only this colour's mask
 
     def kernel(self):
         k = max(1, int(self.cfg["morph_kernel"]))
@@ -261,7 +291,8 @@ class Detector(object):
         return self._kernel
 
     def detect(self, frame):
-        """Returns ((cx, cy, radius, area) or None, mask). Coordinates in full-frame pixels."""
+        """Returns ((cx, cy, radius, area, colour_name) or None, mask).
+        Coordinates in full-frame pixels. The mask is the union of all colour masks."""
         h, w = frame.shape[:2]
         pw = self.cfg["process_width"]
         scale = 1.0
@@ -272,23 +303,31 @@ class Detector(object):
 
         blur = cv2.GaussianBlur(img, (5, 5), 0)
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
-        mask = hsv_mask(hsv, self.cfg["hsv_lower"], self.cfg["hsv_upper"])
         kern = self.kernel()
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kern)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern)
-
-        # [-2] works on both OpenCV 3.x (3 return values) and 4.x (2 return values)
-        contours = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
         min_area = self.cfg["min_area"] * scale * scale
-        best, best_area = None, 0.0
-        for c in contours:
-            a = cv2.contourArea(c)
-            if a >= min_area and a > best_area:
-                best, best_area = c, a
+
+        combined = None
+        preview = None
+        best, best_area, best_name = None, 0.0, None
+        for t in self.cfg["targets"]:
+            mask = hsv_mask(hsv, t["lower"], t["upper"])
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kern)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern)
+            combined = mask if combined is None else cv2.bitwise_or(combined, mask)
+            if t["name"] == self.preview_name:
+                preview = mask
+
+            # [-2] works on both OpenCV 3.x (3 return values) and 4.x (2 return values)
+            contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+            for c in contours:
+                a = cv2.contourArea(c)
+                if a >= min_area and a > best_area:
+                    best, best_area, best_name = c, a, t["name"]
+        out_mask = preview if preview is not None else combined
         if best is None:
-            return None, mask
+            return None, out_mask
         (x, y), r = cv2.minEnclosingCircle(best)
-        return (x / scale, y / scale, r / scale, best_area / (scale * scale)), mask
+        return (x / scale, y / scale, r / scale, best_area / (scale * scale), best_name), out_mask
 
 
 def bearing_deg(tx, ty, sx, sy, invert):
@@ -335,7 +374,7 @@ class Emitter(object):
     def rate_ok(self):
         return time.monotonic() - self.last_t >= self.min_interval
 
-    def target(self, angle, cx, cy, radius):
+    def target(self, angle, cx, cy, radius, colour):
         if not self.rate_ok():
             return False
         if (self.last_state == "TARGET_ACQUIRED" and self.last_angle is not None
@@ -343,7 +382,7 @@ class Emitter(object):
             return False
         self._write({"t": round(time.time(), 3), "state": "TARGET_ACQUIRED",
                      "angle": int(angle), "cx": int(round(cx)), "cy": int(round(cy)),
-                     "radius": int(round(radius))})
+                     "radius": int(round(radius)), "target": colour})
         return True
 
     def searching(self, wait=False):
@@ -453,7 +492,8 @@ def draw_overlay(frame, cfg, state, det, angle, holding, fps, emitter, mode_hint
 
     # big status banner
     if state == "TARGET_ACQUIRED" and angle is not None:
-        text = "TARGET ACQUIRED - BEARING %d" % angle
+        colour = det[4].upper() if det is not None else "TARGET"
+        text = "%s ACQUIRED - BEARING %d" % (colour, angle)
         sc = fit_scale(text, w - 150, 1.0, 2)
         put_text_bg(frame, text, (14, 40), sc, GREEN, 2, degree=True)
         if holding:
@@ -481,10 +521,10 @@ def draw_overlay(frame, cfg, state, det, angle, holding, fps, emitter, mode_hint
 # --------------------------------------------------------------------------- #
 # Tune / calibrate helpers
 # --------------------------------------------------------------------------- #
-TRACKBARS = [  # (name, cfg getter/setter key, index, max)
-    ("H low", "hsv_lower", 0, 179), ("H high", "hsv_upper", 0, 179),
-    ("S low", "hsv_lower", 1, 255), ("S high", "hsv_upper", 1, 255),
-    ("V low", "hsv_lower", 2, 255), ("V high", "hsv_upper", 2, 255),
+TRACKBARS = [  # (name, key in the tuned target dict, index, max)
+    ("H low", "lower", 0, 179), ("H high", "upper", 0, 179),
+    ("S low", "lower", 1, 255), ("S high", "upper", 1, 255),
+    ("V low", "lower", 2, 255), ("V high", "upper", 2, 255),
 ]
 
 
@@ -492,19 +532,19 @@ def _noop(_):
     pass
 
 
-def setup_tune_windows(cfg):
+def setup_tune_windows(cfg, tgt):
     cv2.namedWindow(WIN_CTRL, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN_CTRL, 420, 330)
     for name, key, i, mx in TRACKBARS:
-        cv2.createTrackbar(name, WIN_CTRL, int(cfg[key][i]), mx, _noop)
+        cv2.createTrackbar(name, WIN_CTRL, int(tgt[key][i]), mx, _noop)
     cv2.createTrackbar("Min area", WIN_CTRL, int(cfg["min_area"]), 5000, _noop)
     cv2.createTrackbar("Kernel", WIN_CTRL, int(cfg["morph_kernel"]), 21, _noop)
     cv2.namedWindow(WIN_MASK, cv2.WINDOW_AUTOSIZE)
 
 
-def read_trackbars(cfg):
+def read_trackbars(cfg, tgt):
     for name, key, i, _ in TRACKBARS:
-        cfg[key][i] = cv2.getTrackbarPos(name, WIN_CTRL)
+        tgt[key][i] = cv2.getTrackbarPos(name, WIN_CTRL)
     cfg["min_area"] = cv2.getTrackbarPos("Min area", WIN_CTRL)
     cfg["morph_kernel"] = max(1, cv2.getTrackbarPos("Kernel", WIN_CTRL))
 
@@ -524,7 +564,7 @@ def sample_hsv_to_trackbars(frame, x, y):
     log("sampled HSV (%d,%d,%d) at (%d,%d) -> lower [%d,%d,%d] upper [%d,255,255]"
         % (hm, sm, vm, x, y, h_lo, s_lo, v_lo, h_hi))
     if sm < 80:
-        log("warning: low saturation -- that click looks like glare/white, not orange")
+        log("warning: low saturation -- that click looks like glare/white, not a bright target")
 
 
 # --------------------------------------------------------------------------- #
@@ -532,10 +572,12 @@ def sample_hsv_to_trackbars(frame, x, y):
 # --------------------------------------------------------------------------- #
 def parse_args():
     here = os.path.dirname(os.path.abspath(__file__))
-    p = argparse.ArgumentParser(description="SHIPTRACE orange-target bearing tracker")
+    p = argparse.ArgumentParser(description="SHIPTRACE high-visibility target bearing tracker")
     p.add_argument("--source", default="0", help="camera index (e.g. 0) or path to a video file")
     p.add_argument("--config", default=os.path.join(here, "config.json"), help="config JSON path")
     p.add_argument("--tune", action="store_true", help="HSV trackbars + mask preview; 's' saves")
+    p.add_argument("--tune-target", default=None,
+                   help="which colour to tune, by name from config 'targets' (default: the first)")
     p.add_argument("--calibrate", action="store_true", help="click the servo to save its position")
     p.add_argument("--headless", action="store_true", help="no windows (Pi over SSH)")
     p.add_argument("--record", metavar="OUT.mp4", help="save the annotated video")
@@ -552,6 +594,14 @@ def main():
     cfg = load_config(args.config)
     cv2.setUseOptimized(True)
 
+    tune_tgt = None
+    if args.tune:
+        names = [t["name"] for t in cfg["targets"]]
+        want = args.tune_target or names[0]
+        if want not in names:
+            die("--tune-target '%s' not in config targets %s" % (want, names), 2)
+        tune_tgt = cfg["targets"][names.index(want)]
+
     mode_hint = "tune" if args.tune else ("calibrate" if args.calibrate else "")
     emit_enabled = not (args.tune or args.calibrate)
     if not emit_enabled:
@@ -559,6 +609,8 @@ def main():
 
     src = Source(args.source, cfg)
     detector = Detector(cfg)
+    if tune_tgt is not None:
+        detector.preview_name = tune_tgt["name"]
     emitter = Emitter(cfg, emit_enabled)
     recorder = None
     show = not args.headless
@@ -569,14 +621,15 @@ def main():
     if show:
         cv2.namedWindow(WIN_MAIN, cv2.WINDOW_AUTOSIZE)
         if args.tune:
-            setup_tune_windows(cfg)
+            setup_tune_windows(cfg, tune_tgt)
 
             def on_mouse_tune(event, x, y, flags, param):
                 if event == cv2.EVENT_LBUTTONDOWN and ui["frame"] is not None:
                     sample_hsv_to_trackbars(ui["frame"], x, y)
             cv2.setMouseCallback(WIN_MAIN, on_mouse_tune)
-            log("TUNE: click the orange object to auto-sample, adjust sliders until the Mask "
-                "shows ONLY the target as a solid white blob, then press 's' to save, 'q' to quit")
+            log("TUNE [%s]: click the %s object to auto-sample, adjust sliders until the Mask "
+                "shows ONLY the target as a solid white blob, then press 's' to save, 'q' to quit"
+                % (tune_tgt["name"], tune_tgt["name"]))
         elif args.calibrate:
             def on_mouse_cal(event, x, y, flags, param):
                 if event == cv2.EVENT_LBUTTONDOWN:
@@ -617,7 +670,7 @@ def main():
                 continue
 
             if args.tune and show:
-                read_trackbars(cfg)
+                read_trackbars(cfg, tune_tgt)
 
             det, mask = detector.detect(frame)
             now = time.monotonic()
@@ -632,10 +685,11 @@ def main():
                 angle_i = int(math.floor(ema + 0.5))
                 if state == "SEARCHING" and seen_streak >= cfg["acquire_frames"]:
                     state = "TARGET_ACQUIRED"
-                    log("TARGET ACQUIRED at bearing %d (area %.0f px)" % (angle_i, det[3]))
+                    log("TARGET ACQUIRED (%s) at bearing %d (area %.0f px)"
+                        % (det[4], angle_i, det[3]))
                 if state == "TARGET_ACQUIRED":
                     shown_angle = angle_i
-                    emitter.target(angle_i, det[0], det[1], det[2])
+                    emitter.target(angle_i, det[0], det[1], det[2], det[4])
             else:
                 seen_streak = 0
                 if state == "TARGET_ACQUIRED":
@@ -667,8 +721,8 @@ def main():
                 vis = frame.copy()
                 draw_overlay(vis, cfg, state, det, shown_angle, holding, fps, emitter, mode_hint)
                 if args.tune:
-                    put_text_bg(vis, "TUNE: click target | sliders | s=save q=quit",
-                                (14, 134), 0.5, YELLOW, 1, pad=4)
+                    put_text_bg(vis, "TUNE [%s]: click target | sliders | s=save q=quit"
+                                % tune_tgt["name"], (14, 134), 0.5, YELLOW, 1, pad=4)
                 elif args.calibrate:
                     put_text_bg(vis, "CALIBRATE: click the servo pivot | q=quit",
                                 (14, 134), 0.5, YELLOW, 1, pad=4)
@@ -691,9 +745,9 @@ def main():
                         break
                     if key == ord("s") and args.tune:
                         save_config(args.config, cfg)
-                        log("saved HSV lower %s upper %s min_area %d kernel %d -> %s"
-                            % (cfg["hsv_lower"], cfg["hsv_upper"], cfg["min_area"],
-                               cfg["morph_kernel"], args.config))
+                        log("saved %s HSV lower %s upper %s min_area %d kernel %d -> %s"
+                            % (tune_tgt["name"], tune_tgt["lower"], tune_tgt["upper"],
+                               cfg["min_area"], cfg["morph_kernel"], args.config))
     except KeyboardInterrupt:
         log("interrupted")
     finally:

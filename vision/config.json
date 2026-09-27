@@ -1,13 +1,39 @@
 {
-  "hsv_lower": [5, 120, 120],
-  "hsv_upper": [25, 255, 255],
+  "targets": [
+    {
+      "name": "orange",
+      "lower": [
+        5,
+        120,
+        120
+      ],
+      "upper": [
+        25,
+        255,
+        255
+      ]
+    },
+    {
+      "name": "green",
+      "lower": [
+        35,
+        100,
+        100
+      ],
+      "upper": [
+        80,
+        255,
+        255
+      ]
+    }
+  ],
   "min_area": 150,
   "morph_kernel": 5,
   "servo_x": 320,
   "servo_y": 470,
   "invert": false,
   "ema_alpha": 0.4,
-  "deadband_deg": 2,
+  "deadband_deg": 2.0,
   "max_emit_hz": 4.0,
   "lost_timeout_s": 1.0,
   "acquire_frames": 3,
